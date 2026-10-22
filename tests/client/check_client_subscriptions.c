@@ -3100,6 +3100,214 @@ START_TEST(Client_renewSecureChannel_returnsGoodCallAgain) {
     UA_Client_delete(client);
 } END_TEST
 
+/* A server may hand the monitoredItemId of a deleted MonitoredItem to a new
+ * one, and answer the CreateMonitoredItems of the new item before the
+ * DeleteMonitoredItems of the old one. The delete response must then not
+ * remove the new item from the client. The test server does neither by
+ * itself: its id counter is reset, and its TCP send holds the delete response
+ * back until the create response has been sent (renumbering the sequence
+ * numbers of the reordered messages). */
+static UA_NodeId recycleNodeId;
+static UA_UInt32 recycleNotificationsA;
+static UA_UInt32 recycleNotificationsB;
+static UA_ConnectionManager *recycleCM;
+static UA_StatusCode (*recycleSend)(UA_ConnectionManager *cm, uintptr_t connectionId,
+                                    const UA_KeyValueMap *params, UA_ByteString *buf);
+static UA_Boolean recycleArmed;
+static UA_ByteString recycleHeld[8];
+static size_t recycleHeldSize;
+static UA_Boolean recycleReordered;
+
+static enum ZIP_CMP
+recycleHandleCmp(const void *a, const void *b) {
+    UA_UInt32 ha = ((const UA_Client_MonitoredItem*)a)->parameters.clientHandle;
+    UA_UInt32 hb = ((const UA_Client_MonitoredItem*)b)->parameters.clientHandle;
+    return (ha < hb) ? ZIP_CMP_LESS : (ha > hb) ? ZIP_CMP_MORE : ZIP_CMP_EQ;
+}
+
+ZIP_FUNCTIONS(MonitorItemsTree, UA_Client_MonitoredItem, zipfields,
+              UA_Client_MonitoredItem, zipfields, recycleHandleCmp)
+
+/* Whether the client still holds the MonitoredItem with this clientHandle */
+static UA_Boolean
+recycleKnown(UA_Client *client, UA_UInt32 subId, UA_UInt32 clientHandle) {
+    UA_Client_Subscription *sub;
+    LIST_FOREACH(sub, &client->subscriptions, listEntry) {
+        if(sub->subscriptionId != subId)
+            continue;
+        UA_Client_MonitoredItem dummy;
+        memset(&dummy, 0, sizeof(dummy));
+        dummy.parameters.clientHandle = clientHandle;
+        return ZIP_FIND(MonitorItemsTree, &sub->monitoredItems, &dummy) != NULL;
+    }
+    return false;
+}
+
+static void
+recycleHandler(UA_Client *client, UA_UInt32 subId, void *subContext,
+               UA_UInt32 monId, void *monContext, UA_DataValue *value) {
+    (*(UA_UInt32*)monContext)++;
+}
+
+static UA_UInt16
+recycleResponseType(const UA_ByteString *buf) {
+    if(buf->length < 28 || memcmp(buf->data, "MSGF", 4) != 0 ||
+       buf->data[24] != 0x01 || buf->data[25] != 0x00)
+        return 0;
+    return (UA_UInt16)(buf->data[26] | (buf->data[27] << 8));
+}
+
+static UA_StatusCode
+recycleHoldingSend(UA_ConnectionManager *cm, uintptr_t connectionId,
+                   const UA_KeyValueMap *params, UA_ByteString *buf) {
+    UA_UInt16 type = recycleResponseType(buf);
+    UA_Boolean hold = recycleHeldSize > 0 ||
+        (recycleArmed && type == UA_NS0ID_DELETEMONITOREDITEMSRESPONSE_ENCODING_DEFAULTBINARY);
+    if(!hold)
+        return recycleSend(cm, connectionId, params, buf);
+
+    ck_assert_uint_lt(recycleHeldSize, 8);
+    UA_ByteString_copy(buf, &recycleHeld[recycleHeldSize++]);
+    cm->freeNetworkBuffer(cm, connectionId, buf);
+    if(type != UA_NS0ID_CREATEMONITOREDITEMSRESPONSE_ENCODING_DEFAULTBINARY)
+        return UA_STATUSCODE_GOOD;
+
+    /* Send the create response first, then the delete response and whatever
+     * was held after it, with the sequence numbers in sending order */
+    UA_ByteString order[8];
+    UA_UInt32 seqs[8];
+    order[0] = recycleHeld[recycleHeldSize - 1];
+    for(size_t i = 0; i + 1 < recycleHeldSize; i++)
+        order[i + 1] = recycleHeld[i];
+    for(size_t i = 0; i < recycleHeldSize; i++)
+        memcpy(&seqs[i], recycleHeld[i].data + 16, 4);
+    for(size_t i = 0; i < recycleHeldSize; i++) {
+        memcpy(order[i].data + 16, &seqs[i], 4);
+        recycleSend(cm, connectionId, params, &order[i]);
+    }
+    recycleHeldSize = 0;
+    recycleArmed = false;
+    recycleReordered = true;
+    return UA_STATUSCODE_GOOD;
+}
+
+static void
+recycleIterate(UA_Client *client) {
+    for(size_t i = 0; i < 10; i++) {
+        UA_fakeSleep((UA_UInt32)publishingInterval + 1);
+        UA_Server_run_iterate(server, false);
+        UA_Client_run_iterate(client, 1);
+    }
+}
+
+START_TEST(Client_subscription_deleteRecycledMonitoredItemId) {
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_VariableAttributes attr = UA_VariableAttributes_default;
+    UA_Int32 value = 0;
+    UA_Variant_setScalar(&attr.value, &value, &UA_TYPES[UA_TYPES_INT32]);
+    recycleNodeId = UA_NODEID_STRING(1, "recycle.int");
+    retval = UA_Server_addVariableNode(server, recycleNodeId,
+                                       UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
+                                       UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES),
+                                       UA_QUALIFIEDNAME(1, "recycle.int"),
+                                       UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
+                                       attr, NULL, NULL);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_CreateSubscriptionRequest request = UA_CreateSubscriptionRequest_default();
+    UA_CreateSubscriptionResponse response =
+        UA_Client_Subscriptions_create(client, request, NULL, NULL, NULL);
+    ck_assert_uint_eq(response.responseHeader.serviceResult, UA_STATUSCODE_GOOD);
+    UA_UInt32 subId = response.subscriptionId;
+
+    /* Item A */
+    UA_MonitoredItemCreateRequest item = UA_MonitoredItemCreateRequest_default(recycleNodeId);
+    UA_MonitoredItemCreateResult result =
+        UA_Client_MonitoredItems_createDataChange(client, subId, UA_TIMESTAMPSTORETURN_BOTH,
+                                                  item, &recycleNotificationsA,
+                                                  recycleHandler, NULL);
+    ck_assert_uint_eq(result.statusCode, UA_STATUSCODE_GOOD);
+    UA_UInt32 idA = result.monitoredItemId;
+    UA_UInt32 handleA = client->monitoredItemHandles;
+
+    pauseServer();
+
+    /* The server hands A's id to the next item */
+    lockServer(server);
+    getSubscriptionById(server, subId)->lastMonitoredItemId = idA - 1;
+    unlockServer(server);
+
+    /* The server answers the next create before the delete */
+    UA_EventLoop *el = UA_Server_getConfig(server)->eventLoop;
+    for(UA_EventSource *es = el->eventSources; es; es = es->next) {
+        UA_ConnectionManager *cm = (UA_ConnectionManager*)es;
+        UA_String tcp = UA_STRING("tcp");
+        if(es->eventSourceType == UA_EVENTSOURCETYPE_CONNECTIONMANAGER &&
+           UA_String_equal(&cm->protocol, &tcp))
+            recycleCM = cm;
+    }
+    ck_assert_ptr_ne(recycleCM, NULL);
+    recycleSend = recycleCM->sendWithConnection;
+    recycleCM->sendWithConnection = recycleHoldingSend;
+    recycleArmed = true;
+    recycleReordered = false;
+
+    /* Delete A, then create B */
+    UA_DeleteMonitoredItemsRequest deleteRequest;
+    UA_DeleteMonitoredItemsRequest_init(&deleteRequest);
+    deleteRequest.subscriptionId = subId;
+    deleteRequest.monitoredItemIds = &idA;
+    deleteRequest.monitoredItemIdsSize = 1;
+    retval = UA_Client_MonitoredItems_delete_async(client, deleteRequest, NULL, NULL, NULL);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_CreateMonitoredItemsRequest createRequest;
+    UA_CreateMonitoredItemsRequest_init(&createRequest);
+    createRequest.subscriptionId = subId;
+    createRequest.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+    createRequest.itemsToCreate = &item;
+    createRequest.itemsToCreateSize = 1;
+    void *contexts[1] = {&recycleNotificationsB};
+    UA_Client_DataChangeNotificationCallback callbacks[1] = {recycleHandler};
+    retval = UA_Client_MonitoredItems_createDataChanges_async(client, createRequest, contexts,
+                                                              callbacks, NULL, NULL, NULL, NULL);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    UA_UInt32 handleB = client->monitoredItemHandles;
+
+    recycleIterate(client);
+    ck_assert(recycleReordered);
+    recycleCM->sendWithConnection = recycleSend;
+
+    /* A is gone from the client, B is still there */
+    ck_assert(!recycleKnown(client, subId, handleA));
+    ck_assert(recycleKnown(client, subId, handleB));
+
+    lockServer(server);
+    ck_assert_uint_eq(getSubscriptionById(server, subId)->lastMonitoredItemId, idA);
+    unlockServer(server);
+
+    /* B is still known to the client and receives its data changes */
+    recycleNotificationsA = 0;
+    recycleNotificationsB = 0;
+    for(UA_Int32 i = 1; i <= 3; i++) {
+        UA_Variant v;
+        UA_Variant_setScalar(&v, &i, &UA_TYPES[UA_TYPES_INT32]);
+        retval = UA_Server_writeValue(server, recycleNodeId, v);
+        ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+        recycleIterate(client);
+    }
+    ck_assert_uint_eq(recycleNotificationsA, 0);
+    ck_assert_uint_ge(recycleNotificationsB, 3);
+
+    runServer();
+    UA_Client_Subscriptions_deleteSingle(client, subId);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
+
 typedef struct {
     UA_Client *client;
     UA_UInt32 requestId;
@@ -3693,6 +3901,7 @@ static Suite* testSuite_Client(void) {
     tcase_add_test(tc_client, Client_subscription_modifyAsync);
     tcase_add_test(tc_client, Client_subscription_modifyAsync_invalidSubscriptionId);
     tcase_add_test(tc_client, Client_renewSecureChannel_returnsGoodCallAgain);
+    tcase_add_test(tc_client, Client_subscription_deleteRecycledMonitoredItemId);
     suite_add_tcase(s,tc_client);
 
     TCase *tc_disabledPublishing = tcase_create("Disabled Publishing");
