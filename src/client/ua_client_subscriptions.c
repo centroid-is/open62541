@@ -1001,35 +1001,33 @@ UA_Client_MonitoredItems_createEvents_async(UA_Client *client,
     return res;
 }
 
+/* Forget the requested MonitoredItems locally before the request is sent.
+ * Notifications are addressed by clientHandle and may arrive for a deleted
+ * MonitoredItem even after a positive response (Part 4, DeleteMonitoredItems),
+ * so the client must drop them anyway. Matching the response against the live
+ * tree by monitoredItemId instead would be wrong: the server may hand a freed
+ * id to a new MonitoredItem whose CreateMonitoredItems response is processed
+ * first, and the delete would then remove the new item. */
 static void
-MonitoredItems_delete(UA_Client *client, UA_Client_Subscription *sub,
-                      const UA_DeleteMonitoredItemsRequest *request,
-                      const UA_DeleteMonitoredItemsResponse *response) {
-#ifdef __clang_analyzer__
-    return;
-#endif
+MonitoredItems_forget(UA_Client *client, const UA_DeleteMonitoredItemsRequest *request) {
+    UA_LOCK_ASSERT(&client->clientMutex);
 
-    /* Loop over deleted MonitoredItems */
+    UA_Client_Subscription *sub = findSubscriptionById(client, request->subscriptionId);
+    if(!sub)
+        return;
     struct UA_Client_MonitoredItem_ForDelete deleteMonitoredItem;
     memset(&deleteMonitoredItem, 0, sizeof(struct UA_Client_MonitoredItem_ForDelete));
     deleteMonitoredItem.client = client;
     deleteMonitoredItem.sub = sub;
-
-    for(size_t i = 0; i < response->resultsSize; i++) {
-        if(response->results[i] != UA_STATUSCODE_GOOD &&
-           response->results[i] != UA_STATUSCODE_BADMONITOREDITEMIDINVALID) {
-            continue;
-        }
+    for(size_t i = 0; i < request->monitoredItemIdsSize; i++) {
         deleteMonitoredItem.monitoredItemId = &request->monitoredItemIds[i];
-        /* Delete the internal representation */
-        ZIP_ITER(MonitorItemsTree,&sub->monitoredItems,
+        ZIP_ITER(MonitorItemsTree, &sub->monitoredItems,
                  MonitoredItem_delete_wrapper, &deleteMonitoredItem);
     }
 }
 
 static void
 MonitoredItems_delete_handler(UA_Client *client, void *d, UA_UInt32 requestId, void *r) {
-    UA_Client_Subscription *sub = NULL;
     CustomCallback *cc = (CustomCallback *)d;
     UA_DeleteMonitoredItemsResponse *response = (UA_DeleteMonitoredItemsResponse *)r;
     UA_DeleteMonitoredItemsRequest *request =
@@ -1037,21 +1035,6 @@ MonitoredItems_delete_handler(UA_Client *client, void *d, UA_UInt32 requestId, v
 
     lockClient(client);
 
-    if(response->responseHeader.serviceResult != UA_STATUSCODE_GOOD)
-        goto cleanup;
-
-    sub = findSubscriptionById(client, request->subscriptionId);
-    if(!sub) {
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                    "No internal representation of subscription %" PRIu32,
-                    request->subscriptionId);
-        goto cleanup;
-    }
-
-    /* Delete MonitoredItems from the internal representation */
-    MonitoredItems_delete(client, sub, request, response);
-
-cleanup:
     if(cc->callback.deleteMonitoredItems)
         cc->callback.deleteMonitoredItems(client, cc->userData, requestId, response);
     UA_DeleteMonitoredItemsRequest_delete(request);
@@ -1063,32 +1046,14 @@ cleanup:
 UA_DeleteMonitoredItemsResponse
 UA_Client_MonitoredItems_delete(UA_Client *client,
                                 const UA_DeleteMonitoredItemsRequest request) {
+    lockClient(client);
+    MonitoredItems_forget(client, &request);
+    unlockClient(client);
+
     /* Send the request */
     UA_DeleteMonitoredItemsResponse response;
     __UA_Client_Service(client, &request, &UA_TYPES[UA_TYPES_DELETEMONITOREDITEMSREQUEST],
                         &response, &UA_TYPES[UA_TYPES_DELETEMONITOREDITEMSRESPONSE]);
-
-    /* A problem occurred remote? */
-    if(response.responseHeader.serviceResult != UA_STATUSCODE_GOOD)
-        return response;
-
-    lockClient(client);
-
-    /* Find the internal subscription representation */
-    UA_Client_Subscription *sub = findSubscriptionById(client, request.subscriptionId);
-    if(!sub) {
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                    "No internal representation of subscription %" PRIu32,
-                    request.subscriptionId);
-        unlockClient(client);
-        return response;
-    }
-
-    /* Remove MonitoredItems in the internal representation */
-    MonitoredItems_delete(client, sub, &request, &response);
-
-    unlockClient(client);
-
     return response;
 }
 
@@ -1113,16 +1078,22 @@ UA_Client_MonitoredItems_delete_async(UA_Client *client,
     cc->callback.deleteMonitoredItems = callback;
     cc->userData = userdata;
 
+    /* Send the request and forget the MonitoredItems under the same lock, so
+     * that no response is processed in between */
+    lockClient(client);
     UA_StatusCode res =
-        __UA_Client_AsyncService(client, &request,
-                                 &UA_TYPES[UA_TYPES_DELETEMONITOREDITEMSREQUEST],
-                                 MonitoredItems_delete_handler,
-                                 &UA_TYPES[UA_TYPES_DELETEMONITOREDITEMSRESPONSE],
-                                 cc, requestId);
-    if(res != UA_STATUSCODE_GOOD) {
+        __Client_AsyncService(client, &request,
+                              &UA_TYPES[UA_TYPES_DELETEMONITOREDITEMSREQUEST],
+                              MonitoredItems_delete_handler,
+                              &UA_TYPES[UA_TYPES_DELETEMONITOREDITEMSRESPONSE],
+                              cc, requestId);
+    if(res == UA_STATUSCODE_GOOD) {
+        MonitoredItems_forget(client, &request);
+    } else {
         UA_DeleteMonitoredItemsRequest_delete(req_copy);
         UA_free(cc);
     }
+    unlockClient(client);
     return res;
 }
 
