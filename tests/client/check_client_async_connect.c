@@ -10,6 +10,7 @@
 #include "open62541/common.h"
 
 #include "client/ua_client_internal.h"
+#include "server/ua_server_internal.h"
 
 #include <check.h>
 #include <stdlib.h>
@@ -282,6 +283,141 @@ START_TEST(Client_connectUsername_async) {
 }
 END_TEST
 
+/* Iterate server and client (in that order) until the client reaches the
+ * SessionState target, the session is activated or the connectStatus turns
+ * bad. Returns the reached SessionState. */
+static UA_SessionState
+iterateUntilSessionState(UA_Client *client, UA_SessionState target) {
+    UA_SessionState ss = UA_SESSIONSTATE_CLOSED;
+    UA_StatusCode cs = UA_STATUSCODE_GOOD;
+    for(size_t i = 0; i < 2000; i++) {
+        UA_Client_getState(client, NULL, &ss, &cs);
+        if(ss == target || ss == UA_SESSIONSTATE_ACTIVATED ||
+           cs != UA_STATUSCODE_GOOD)
+            break;
+        UA_Server_run_iterate(server, false);
+        UA_Client_run_iterate(client, 1);
+    }
+    return ss;
+}
+
+static void
+readValueCallback(UA_Client *client, void *userdata, UA_UInt32 requestId,
+                  UA_StatusCode status, UA_DataValue *value) {
+    UA_StatusCode *res = (UA_StatusCode*)userdata;
+    *res = status;
+    if(status == UA_STATUSCODE_GOOD && !value->hasValue)
+        *res = UA_STATUSCODE_BADUNEXPECTEDERROR;
+}
+
+/* The client recovered completely: Session activated, connectStatus good and
+ * a service call goes through. */
+static void
+assertRecovered(UA_Client *client) {
+    UA_SessionState ss =
+        iterateUntilSessionState(client, UA_SESSIONSTATE_ACTIVATED);
+    UA_SecureChannelState cs;
+    UA_StatusCode connectStatus;
+    UA_Client_getState(client, &cs, &ss, &connectStatus);
+    ck_assert_msg(connectStatus == UA_STATUSCODE_GOOD,
+                  "The client latched the connectStatus %s and does not recover",
+                  UA_StatusCode_name(connectStatus));
+    ck_assert_uint_eq(cs, UA_SECURECHANNELSTATE_OPEN);
+    ck_assert_uint_eq(ss, UA_SESSIONSTATE_ACTIVATED);
+
+    UA_StatusCode readRes = UA_STATUSCODE_BADWAITINGFORRESPONSE;
+    UA_StatusCode retval =
+        UA_Client_readValueAttribute_async(client,
+            UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_STATE),
+            readValueCallback, &readRes, NULL);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    for(size_t i = 0; i < 1000 && readRes == UA_STATUSCODE_BADWAITINGFORRESPONSE; i++) {
+        UA_Server_run_iterate(server, false);
+        UA_Client_run_iterate(client, 1);
+    }
+    ck_assert_uint_eq(readRes, UA_STATUSCODE_GOOD);
+}
+
+/* Close the Session and the SecureChannel while the server keeps running */
+static void
+disconnectAndDelete(UA_Client *client) {
+    UA_Client_disconnectAsync(client);
+    for(size_t i = 0; i < 1000 &&
+            client->channel.state != UA_SECURECHANNELSTATE_CLOSED; i++) {
+        UA_Server_run_iterate(server, false);
+        UA_Client_run_iterate(client, 1);
+    }
+    UA_Client_delete(client);
+}
+
+/* The TCP connection drops while the CreateSession / ActivateSession request
+ * is outstanding. The pending request is cancelled locally with
+ * BadSecureChannelClosed. That is a transport error and not a rejection of the
+ * Session by the server. The client must reconnect on its own and end up with
+ * an activated Session. */
+static void
+dropConnectionDuringSessionHandshake(UA_SessionState dropState) {
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retval =
+        UA_Client_connectAsync(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    /* The request is sent at the end of the client iteration. The server has
+     * not been iterated since, so no response can have been processed. */
+    UA_SessionState ss = iterateUntilSessionState(client, dropState);
+    ck_assert_uint_eq(ss, dropState);
+
+    /* Drop the TCP connection from below the SecureChannel */
+    UA_ConnectionManager *cm = client->channel.connectionManager;
+    cm->closeConnection(cm, client->channel.connectionId);
+
+    assertRecovered(client);
+    disconnectAndDelete(client);
+}
+
+START_TEST(Client_connect_async_drop_during_createSession) {
+    dropConnectionDuringSessionHandshake(UA_SESSIONSTATE_CREATE_REQUESTED);
+} END_TEST
+
+START_TEST(Client_connect_async_drop_during_activateSession) {
+    dropConnectionDuringSessionHandshake(UA_SESSIONSTATE_ACTIVATE_REQUESTED);
+} END_TEST
+
+/* A service request is sent while the Session handshake is ongoing. The
+ * request carries no AuthenticationToken yet and the server answers it with
+ * BadSessionIdInvalid. That response must not tear down the Session that is
+ * being created/activated right now. Doing so cancels the outstanding
+ * CreateSession/ActivateSession and sends a new CreateSession, orphaning the
+ * first Session on the server (and with Sign/SignAndEncrypt the reply to the
+ * first CreateSession is checked against the nonce of the second one). */
+START_TEST(Client_connect_async_service_during_createSession) {
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_StatusCode retval =
+        UA_Client_connectAsync(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    UA_SessionState ss =
+        iterateUntilSessionState(client, UA_SESSIONSTATE_CREATE_REQUESTED);
+    ck_assert_uint_eq(ss, UA_SESSIONSTATE_CREATE_REQUESTED);
+
+    /* Send a Read before the Session is activated */
+    UA_StatusCode readRes = UA_STATUSCODE_BADWAITINGFORRESPONSE;
+    retval = UA_Client_readValueAttribute_async(client,
+                 UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_STATE),
+                 readValueCallback, &readRes, NULL);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    assertRecovered(client);
+    ck_assert_uint_ne(readRes, UA_STATUSCODE_GOOD); /* Rejected by the server */
+
+    /* Only the one Session was created. server->sessionCount counts created
+     * Sessions; the public statistics count activated ones only and cannot
+     * see the orphaned Session, which is never activated. */
+    ck_assert_uint_eq(server->sessionCount, 1);
+
+    disconnectAndDelete(client);
+} END_TEST
+
 static Suite* testSuite_Client(void) {
     Suite *s = suite_create("Client");
     TCase *tc_client_connect = tcase_create("Client Connect Async");
@@ -294,6 +430,9 @@ static Suite* testSuite_Client(void) {
     tcase_add_test(tc_client_connect, Client_connectSecureChannelAsync);
     tcase_add_test(tc_client_connect, Client_connect_async_wrongUrl);
     tcase_add_test(tc_client_connect, Client_connectUsername_async);
+    tcase_add_test(tc_client_connect, Client_connect_async_drop_during_createSession);
+    tcase_add_test(tc_client_connect, Client_connect_async_drop_during_activateSession);
+    tcase_add_test(tc_client_connect, Client_connect_async_service_during_createSession);
     suite_add_tcase(s,tc_client_connect);
     return s;
 }

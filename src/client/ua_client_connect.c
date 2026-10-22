@@ -987,6 +987,20 @@ responseActivateSession(UA_Client *client, void *userdata,
     UA_LOCK_ASSERT(&client->clientMutex);
 
     UA_ActivateSessionResponse *ar = (UA_ActivateSessionResponse*)response;
+
+    /* The request was cancelled locally because the SecureChannel closed
+     * before the response arrived (__Client_AsyncService_removeAll). This is
+     * not a rejection by the server. The Session was created and can be
+     * re-activated on the next SecureChannel. Set the state to CREATED, as is
+     * done for an ACTIVATED Session when the SecureChannel closes. If the
+     * server has removed the Session in the meantime, the next
+     * ActivateSession fails with BadSessionIdInvalid and a new Session is
+     * created below. */
+    if(ar->responseHeader.serviceResult == UA_STATUSCODE_BADSECURECHANNELCLOSED) {
+        client->sessionState = UA_SESSIONSTATE_CREATED;
+        return;
+    }
+
     if(ar->responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
         /* Activating the Session failed */
         cleanupSession(client);
@@ -1856,6 +1870,16 @@ createSessionCallback(UA_Client *client, void *userdata,
 
     UA_CreateSessionResponse *csr = (UA_CreateSessionResponse*)response;
     UA_StatusCode res = csr->responseHeader.serviceResult;
+
+    /* The request was cancelled locally because the SecureChannel closed
+     * before the response arrived. This is not a rejection by the server. The
+     * SecureChannel is reopened and the next connect iteration sends a new
+     * CreateSession. Do not set the (fatal) connectStatus. */
+    if(res == UA_STATUSCODE_BADSECURECHANNELCLOSED) {
+        client->sessionState = UA_SESSIONSTATE_CLOSED;
+        return;
+    }
+
     if(res != UA_STATUSCODE_GOOD)
         goto cleanup;
 
