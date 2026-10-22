@@ -740,8 +740,18 @@ __Client_processServiceResponsePayload(UA_Client *client, UA_UInt32 requestId,
     }
 
     /* The Session closed. The current response is processed with the return code.
-     * The next request first recreates a session. */
-    if(responseType != &UA_TYPES[UA_TYPES_ACTIVATESESSIONRESPONSE] &&
+     * The next request first recreates a session.
+     *
+     * Only do this while the Session is ACTIVATED. In every other state a new
+     * Session is being created or activated (or none exists), and the
+     * BadSessionIdInvalid/BadSessionClosed response belongs to a request that
+     * was sent before the Session was activated. Tearing the state down here
+     * cancels the outstanding CreateSession/ActivateSession and sends a second
+     * CreateSession. The first Session is orphaned on the server. And with
+     * Sign/SignAndEncrypt the response to the first CreateSession is verified
+     * against the nonce of the second request. */
+    if(client->sessionState == UA_SESSIONSTATE_ACTIVATED &&
+       responseType != &UA_TYPES[UA_TYPES_ACTIVATESESSIONRESPONSE] &&
        (response->responseHeader.serviceResult == UA_STATUSCODE_BADSESSIONIDINVALID ||
         response->responseHeader.serviceResult == UA_STATUSCODE_BADSESSIONCLOSED)) {
         /* Clean up the session information and reset the state */
